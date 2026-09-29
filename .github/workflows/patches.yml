@@ -1,0 +1,38 @@
+name: patches
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - patches/**
+      - tools/patches
+      - .github/workflows/patches.yml
+  pull_request:
+    paths:
+      - patches/**
+      - tools/patches
+      - .github/workflows/patches.yml
+  schedule:
+    - cron: "43 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  apply-check:
+    name: Apply check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Patches apply cleanly to this repo (HEAD)
+        run: tools/patches check HEAD
+
+      - name: Fetch latest upstream
+        run: |
+          git remote add upstream https://github.com/agentjido/jido_ai.git
+          git fetch --quiet upstream main
+
+      - name: Patches apply cleanly to latest upstream
+        run: tools/patches check upstream/main
