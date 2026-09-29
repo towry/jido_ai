@@ -104,6 +104,12 @@ version already on hex all abort **before** anything is uploaded.
 Manual fallback (a machine already logged in via `mix hex.user auth`):
 `tools/patches apply && mix test && mix hex.publish && tools/patches reset`.
 
+> **Repo setting:** upstream's `Release` workflow is disabled in this fork
+> (`gh workflow disable` — visible under Settings → Actions). It fires on the
+> same `v*` tags but reads the **unpatched** `mix.exs` on main (always
+> `2.3.0` here), so it would fail on every fork release; `publish.yml` owns
+> releasing. Re-enable it only if upstream's release flow is ever wanted.
+
 ## Rules
 
 1. Commits on `main` may only **add** files. Never modify an upstream file in
