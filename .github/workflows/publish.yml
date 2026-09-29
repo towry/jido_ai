@@ -1,0 +1,57 @@
+name: publish
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish to hex.pm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "29"
+          elixir-version: "1.20"
+
+      - name: Apply patches and verify tag matches patched version
+        run: |
+          tools/patches apply
+          patched="$(sed -nE 's/^ *@version "([^"]+)"/\1/p' mix.exs)"
+          tagged="${GITHUB_REF_NAME#v}"
+          if [ "$patched" != "$tagged" ]; then
+            echo "tag v${tagged} does not match patched mix.exs @version ${patched}" >&2
+            exit 1
+          fi
+          echo "publishing version ${patched}"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-mix-${{ hashFiles('mix.lock') }}
+
+      - run: mix local.hex --if-missing
+      - run: mix local.rebar --if-missing
+      - run: mix deps.get
+      - run: mix test
+      - run: mix compile
+      - name: Build package (sanity)
+        run: mix hex.build
+
+      - name: Publish
+        env:
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+        run: |
+          if [ -z "$HEX_API_KEY" ]; then
+            echo "HEX_API_KEY repository secret is not set" >&2
+            exit 1
+          fi
+          mix hex.publish --yes

@@ -57,20 +57,35 @@ schedule. It checks:
 - `check upstream/main` — upstream moved under a patch → run the *Sync from
   upstream* flow above and push the re-exported patches.
 
-### Publish to hex (`jido_ai_twpatch`)
+### Publish to hex (`jido_ai_twpatch`) — via CI
+
+The fork owns an independent version line on hex: it starts at `2.3.1`
+(upstream base `2.3.0` + this fork's first release) and the patch segment
+increments on every release. The single source of truth is `@version` in
+`mix.exs` **of the patched tree**, owned by `patches/0003-release-version.patch`
+(the only patch allowed to touch `@version`; when upstream bumps its own
+version, that conflict lands here — resolve by keeping the fork's number).
 
 ```sh
-tools/patches apply
-mix test
-mix hex.build        # sanity: produces jido_ai_twpatch-<version>.tar (gitignored)
-mix hex.publish
-rm -f jido_ai_twpatch-*.tar
-tools/patches reset
+tools/patches apply            # full stack
+# edit @version in mix.exs, e.g. 2.3.1 -> 2.3.2
+tools/patches rebuild 3        # re-exports the release patch in place
+tools/patches reset && tools/patches check
+git add patches && git commit -m "chore: release 2.3.2"
+git tag v2.3.2 && git push origin main v2.3.2
 ```
 
-Every release needs a new version: edit `@version` in `mix.exs` **while
-patched**, then `tools/patches add "release 2.3.1"` (a dedicated release
-patch), or rebuild the patch that already owns version changes.
+The `publish` workflow (tag push `v*`) then applies the stack, **verifies the
+tag equals the patched `@version`**, runs `mix test`, builds the tarball and
+publishes with `mix hex.publish --yes` using the `HEX_API_KEY` repository
+secret (hex.pm dashboard → Keys → *Generate New Key* → Write:API → store it
+with `gh secret set HEX_API_KEY --repo towry/jido_ai`).
+
+Guards: a tag/`@version` mismatch, a missing secret, failing tests, or a
+version already on hex all abort **before** anything is uploaded.
+
+Manual fallback (a machine already logged in via `mix hex.user auth`):
+`tools/patches apply && mix test && mix hex.publish && tools/patches reset`.
 
 ## Rules
 
