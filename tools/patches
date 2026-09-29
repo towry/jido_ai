@@ -1,0 +1,252 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Patch-stack manager for this fork.
+#
+# main stays pure upstream code plus additive infra files only; every fork
+# customization lives as .patch files in patches/ and is applied on demand.
+# Patches are checked/applied/re-exported without ever committing changes to
+# upstream-owned files.
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$root"
+
+PATCH_DIR="patches"
+# Infra paths this workflow owns — never exported into a patch.
+EXCLUDES=(
+  ':(exclude)patches'
+  ':(exclude)tools'
+  ':(exclude)PATCHING.md'
+  ':(exclude).agents'
+  ':(exclude).github/workflows/patches.yml'
+  ':(exclude)jido_ai-*'
+)
+
+TMPFILES=()
+cleanup() {
+  if [ "${#TMPFILES[@]}" -gt 0 ]; then
+    rm -f "${TMPFILES[@]}"
+  fi
+}
+trap cleanup EXIT
+
+tmpfile() {
+  local f
+  f="$(mktemp)"
+  TMPFILES+=("$f")
+  printf '%s' "$f"
+}
+
+die() {
+  echo "patches: $*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+usage: tools/patches <command> [args]
+
+  check [ref]      verify all patches apply cleanly in order against ref (default HEAD)
+  apply            patch the working tree (git apply --3way; requires clean tree)
+  reset            restore working tree to clean main
+  add <desc>       export current patched worktree changes as the next patch file
+  rebuild <n>      re-export patch n (after resolving conflicts), re-apply the rest
+  list             show the patch stack
+
+See PATCHING.md for the full workflows (sync upstream, resolve CI conflicts,
+publish to hex).
+EOF
+}
+
+load_patches() {
+  PATCHES=()
+  local f
+  while IFS= read -r f; do
+    PATCHES+=("$f")
+  done < <(find "$PATCH_DIR" -maxdepth 1 -type f -name '*.patch' 2>/dev/null | LC_ALL=C sort)
+}
+
+require_clean() {
+  [ -z "$(git status --porcelain)" ] ||
+    die "working tree not clean — commit or remove stray files first (git status)"
+}
+
+require_no_markers() {
+  local f
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    if grep -q '^<<<<<<< ' "$f" 2>/dev/null; then
+      die "unresolved conflict markers in $f — resolve them first"
+    fi
+  done < <(git diff --name-only HEAD)
+}
+
+# Echo the tree of HEAD with the first $2 patches applied (temp index only).
+chain_tree() {
+  local ref="$1" count="$2" idx i
+  idx="$(tmpfile)"
+  GIT_INDEX_FILE="$idx" git read-tree "$ref"
+  for ((i = 0; i < count; i++)); do
+    if ! GIT_INDEX_FILE="$idx" git apply --cached "${PATCHES[$i]}"; then
+      die "patch ${PATCHES[$i]} does not apply cleanly on top of the previous ones"
+    fi
+  done
+  GIT_INDEX_FILE="$idx" git write-tree
+}
+
+# Echo the tree of a base tree + current worktree (infra paths excluded).
+snapshot_tree() {
+  local base="$1" idx
+  idx="$(tmpfile)"
+  GIT_INDEX_FILE="$idx" git read-tree "$base"
+  GIT_INDEX_FILE="$idx" git add -A -- . "${EXCLUDES[@]}"
+  GIT_INDEX_FILE="$idx" git write-tree
+}
+
+# export_diff <base-tree> <new-tree> <outfile>
+# Refuse binary sweeps (almost always stray build artifacts), print the stat,
+# and write the patch.
+export_diff() {
+  local base="$1" new="$2" outfile="$3" bin
+  bin="$(git diff --numstat "$base" "$new" | awk '$1 == "-" && $2 == "-" {print $3}')"
+  if [ -n "$bin" ]; then
+    die "binary file(s) in snapshot: $bin — remove stray artifacts; refusing to export a broken patch"
+  fi
+  git diff --stat "$base" "$new"
+  git diff "$base" "$new" >"$outfile"
+}
+
+cmd_check() {
+  local ref="${1:-HEAD}"
+  git rev-parse --verify --quiet "$ref^{commit}" >/dev/null || die "unknown ref: $ref"
+  load_patches
+  if [ "${#PATCHES[@]}" -eq 0 ]; then
+    echo "OK: no patch files"
+    return
+  fi
+  local idx i
+  idx="$(tmpfile)"
+  GIT_INDEX_FILE="$idx" git read-tree "$ref"
+  for i in "${!PATCHES[@]}"; do
+    if ! GIT_INDEX_FILE="$idx" git apply --cached "${PATCHES[$i]}"; then
+      echo "FAIL: ${PATCHES[$i]} does not apply cleanly against $ref" >&2
+      echo "→ run 'tools/patches apply', resolve, then 'tools/patches rebuild $((i + 1))' (see PATCHING.md)" >&2
+      exit 1
+    fi
+  done
+  echo "OK: ${#PATCHES[@]} patch(es) apply cleanly against $ref"
+}
+
+cmd_apply() {
+  require_clean
+  load_patches
+  local i
+  for i in "${!PATCHES[@]}"; do
+    if ! git apply --3way "${PATCHES[$i]}"; then
+      echo "" >&2
+      echo "CONFLICT: patch $((i + 1))/${#PATCHES[@]} (${PATCHES[$i]}) did not apply cleanly." >&2
+      echo "Resolve the conflict markers, then run:  tools/patches rebuild $((i + 1))" >&2
+      exit 1
+    fi
+    echo "applied ${PATCHES[$i]}"
+  done
+  # --3way stages what it applies; unstage so a bare `git commit` can never
+  # ship patched upstream files. Only explicitly `git add`ed paths commit.
+  git reset -q
+  echo "worktree is now patched (all changes unstaged); 'tools/patches reset' restores clean main"
+}
+
+cmd_reset() {
+  if ! git diff --quiet HEAD -- "$PATCH_DIR" 2>/dev/null; then
+    die "patch files differ from HEAD — commit them first (git add $PATCH_DIR && git commit), or 'git restore --source=HEAD --staged --worktree -- $PATCH_DIR/' to discard the rebuild"
+  fi
+  git restore --source=HEAD --staged --worktree -- .
+  local left
+  left="$(git status --porcelain | grep '^??' || true)"
+  if [ -n "$left" ]; then
+    echo "note: untracked files left in place:" >&2
+    echo "$left" >&2
+  fi
+  echo "worktree restored to clean main"
+}
+
+cmd_add() {
+  local desc="${1:-}"
+  [ -n "$desc" ] || die "usage: tools/patches add <short-desc>"
+  require_no_markers
+  load_patches
+  local slug base new n next name
+  slug="$(printf '%s' "$desc" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed -e 's/^-//' -e 's/-$//')"
+  [ -n "$slug" ] || die "empty description after sanitizing"
+  base="$(chain_tree HEAD "${#PATCHES[@]}")"
+  new="$(snapshot_tree "$base")"
+  [ "$base" != "$new" ] || die "no worktree changes found to export"
+  n="$(printf '%s\n' "${PATCHES[@]##*/}" | sed -n 's/^\([0-9]\{1,\}\)-.*/\1/p' | sort -n | tail -1)"
+  n="${n:-0}"
+  next=$((10#$n + 1))
+  name="$(printf '%04d-%s.patch' "$next" "$slug")"
+  export_diff "$base" "$new" "$PATCH_DIR/$name"
+  echo "exported $PATCH_DIR/$name"
+  echo "next: 'tools/patches reset && tools/patches check' then commit the new patch file"
+}
+
+cmd_rebuild() {
+  local num="${1:-}"
+  [ -n "$num" ] || die "usage: tools/patches rebuild <n>"
+  load_patches
+  case "$num" in
+    '' | *[!0-9]*) die "n must be a positive integer" ;;
+  esac
+  [ "$num" -ge 1 ] && [ "$num" -le "${#PATCHES[@]}" ] ||
+    die "only ${#PATCHES[@]} patch(es) exist"
+  require_no_markers
+  local target base new i
+  target="${PATCHES[$((num - 1))]}"
+  base="$(chain_tree HEAD $((num - 1)))"
+  new="$(snapshot_tree "$base")"
+  [ "$base" != "$new" ] || die "no worktree changes for patch $num — nothing to rebuild"
+  export_diff "$base" "$new" "$target"
+  echo "rebuilt $target"
+  # Sync the real index with the resolved worktree so the next --3way applies
+  # see a consistent state (also clears any unmerged entries).
+  git add -A -- .
+  for ((i = num; i < ${#PATCHES[@]}; i++)); do
+    if ! git apply --3way "${PATCHES[$i]}"; then
+      echo "" >&2
+      echo "CONFLICT: patch $((i + 1))/${#PATCHES[@]} (${PATCHES[$i]}) did not re-apply." >&2
+      echo "Resolve the conflict markers, then run:  tools/patches rebuild $((i + 1))" >&2
+      exit 1
+    fi
+    echo "re-applied ${PATCHES[$i]}"
+  done
+  # Never leave the patched upstream files staged: `git commit` without a
+  # pathspec would commit them. Everything stays worktree-only.
+  git reset -q
+  echo "stack rebuilt and fully applied (all changes unstaged); next: 'tools/patches check', then 'git add patches && git commit', or 'tools/patches reset'"
+}
+
+cmd_list() {
+  load_patches
+  local i
+  for i in "${!PATCHES[@]}"; do
+    printf '%d\t%s\n' "$((i + 1))" "${PATCHES[$i]}"
+  done
+}
+
+cmd="${1:-help}"
+if [ "$#" -gt 0 ]; then
+  shift
+fi
+case "$cmd" in
+  check) cmd_check "$@" ;;
+  apply) cmd_apply "$@" ;;
+  reset) cmd_reset "$@" ;;
+  add) cmd_add "$@" ;;
+  rebuild) cmd_rebuild "$@" ;;
+  list) cmd_list ;;
+  help | -h | --help) usage ;;
+  *)
+    usage >&2
+    die "unknown command: $cmd"
+    ;;
+esac
