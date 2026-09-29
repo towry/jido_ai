@@ -1,8 +1,8 @@
 diff --git a/lib/jido_ai/reasoning/react/request_transformer.ex b/lib/jido_ai/reasoning/react/request_transformer.ex
-index c87c0581..16a6ca36 100644
+index c87c0581..7a0909a3 100644
 --- a/lib/jido_ai/reasoning/react/request_transformer.ex
 +++ b/lib/jido_ai/reasoning/react/request_transformer.ex
-@@ -81,6 +81,78 @@ defmodule Jido.AI.Reasoning.ReAct.RequestTransformer do
+@@ -81,6 +81,81 @@ defmodule Jido.AI.Reasoning.ReAct.RequestTransformer do
    @callback transform_request(request(), State.t(), Config.t(), map()) ::
                {:ok, overrides()} | {:error, term()}
  
@@ -49,7 +49,9 @@ index c87c0581..16a6ca36 100644
 +  extends the iteration budget or triggers an extra model request.
 +
 +  `state` already contains this round's tool results; `runtime_context` is the
-+  unchanged runtime context of the request (no parent projection copy).
++  request's runtime context with this round's state snapshot already evolved
++  — the same context the next turn's `transform_request/4` receives (no
++  parent projection copy).
 +
 +  Return values:
 +
@@ -59,8 +61,9 @@ index c87c0581..16a6ca36 100644
 +
 +  Raises, throws, exits and invalid returns become stable typed failures
 +  (`:callback_exception`, `:callback_throw`, `:callback_exit`,
-+  `{:invalid_callback_result, other}`); exception messages and stacktraces are
-+  never placed into the failure reason or model-visible output.
++  `:invalid_callback_result`); exception messages, stacktraces and invalid
++  return bodies are never placed into the failure reason or model-visible
++  output.
 +
 +  To push corrective feedback to the next model turn, enqueue it on
 +  `config.pending_input_server` via `Jido.AI.PendingInputServer.enqueue/2` and
@@ -81,7 +84,7 @@ index c87c0581..16a6ca36 100644
    @doc """
    Transform the final tool definitions sent to the LLM on each turn.
  
-@@ -100,5 +172,5 @@ defmodule Jido.AI.Reasoning.ReAct.RequestTransformer do
+@@ -100,5 +175,5 @@ defmodule Jido.AI.Reasoning.ReAct.RequestTransformer do
    @callback transform_tool_definitions([ReqLLM.Tool.t()], State.t(), Config.t(), map()) ::
                {:ok, [ReqLLM.Tool.t()]} | {:error, term()}
  
@@ -89,7 +92,7 @@ index c87c0581..16a6ca36 100644
 +  @optional_callbacks transform_tool_definitions: 4, after_tool_round: 4
  end
 diff --git a/lib/jido_ai/reasoning/react/runner.ex b/lib/jido_ai/reasoning/react/runner.ex
-index 6fcbb1fd..95430f90 100644
+index 6fcbb1fd..6165a146 100644
 --- a/lib/jido_ai/reasoning/react/runner.ex
 +++ b/lib/jido_ai/reasoning/react/runner.ex
 @@ -814,15 +814,33 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
@@ -117,7 +120,7 @@ index 6fcbb1fd..95430f90 100644
 +
 +                  next_context = evolve_context_state_snapshot(context, ordered_results)
 +
-+                  case maybe_after_tool_round(config, state, context, completed_iteration, ordered_results) do
++                  case maybe_after_tool_round(config, state, next_context, completed_iteration, ordered_results) do
 +                    :ok ->
 +                      {state, _token} = emit_checkpoint(state, owner, ref, config, :after_tools)
 +                      {:ok, state, next_context}
@@ -193,8 +196,8 @@ index 6fcbb1fd..95430f90 100644
 +          {:error, reason} ->
 +            {:error, {:after_tool_round, reason}}
 +
-+          other ->
-+            {:error, {:after_tool_round, {:invalid_callback_result, other}}}
++          _other ->
++            {:error, {:after_tool_round, :invalid_callback_result}}
 +        end
 +      catch
 +        :error, _ -> {:error, {:after_tool_round, :callback_exception}}
@@ -234,10 +237,10 @@ index 6fcbb1fd..95430f90 100644
      %{
        id: pending_call.id,
 diff --git a/test/jido_ai/react/runtime_runner_test.exs b/test/jido_ai/react/runtime_runner_test.exs
-index bc700210..967d1f44 100644
+index bc700210..3b6294f7 100644
 --- a/test/jido_ai/react/runtime_runner_test.exs
 +++ b/test/jido_ai/react/runtime_runner_test.exs
-@@ -2926,6 +2926,1003 @@ defmodule Jido.AI.Reasoning.ReAct.RuntimeRunnerTest do
+@@ -2926,6 +2926,1051 @@ defmodule Jido.AI.Reasoning.ReAct.RuntimeRunnerTest do
      |> Enum.map(&Enum.join/1)
    end
  
@@ -366,7 +369,7 @@ index bc700210..967d1f44 100644
 +
 +    def after_tool_round(_round, _state, _config, runtime_context) do
 +      send(runtime_context[:test_pid], {:after_tool_round_invalid, :before})
-+      {:feedback, "should-not-be-legal"}
++      %{candidate: "SECRET_RETURN_DETAIL"}
 +    end
 +  end
 +
@@ -493,8 +496,9 @@ index bc700210..967d1f44 100644
 +    tool_messages = Enum.filter(AIContext.to_messages(state.context), &(&1.role == :tool))
 +    assert length(tool_messages) == 2
 +
-+    # runtime_context is preserved: same identity fields, same map as the
-+    # first transform_request turn, not a copied parent projection.
++    # runtime_context is the evolved context: this round's tool effects are
++    # already applied to the state snapshot, and it is the same map the next
++    # turn's transform_request receives — not the pre-round context.
 +    assert runtime_context[:request_id] == "req_rva"
 +    assert runtime_context[:run_id] == "run_rva"
 +    assert_receive {:transform_request_ctx, first_turn_pid, first_turn_ctx}, 3_000
@@ -503,7 +507,9 @@ index bc700210..967d1f44 100644
 +    # runner/coordinator) — no background callback task.
 +    assert first_turn_pid == cb_pid
 +    assert second_turn_pid == cb_pid
-+    assert runtime_context == first_turn_ctx
++    assert runtime_context[:state] == %{rv_slow_done: true, rv_fast_done: true}
++    assert runtime_context == second_turn_ctx
++    refute runtime_context == first_turn_ctx
 +    assert second_turn_ctx[:request_id] == "req_rva"
 +    refute second_turn_ctx == first_turn_ctx
 +  end
@@ -794,8 +800,7 @@ index bc700210..967d1f44 100644
 +          {RaiseRoundTransformer, {:after_tool_round, :callback_exception}, {:after_tool_round_raised, :before}},
 +          {ThrowRoundTransformer, {:after_tool_round, :callback_throw}, {:after_tool_round_threw, :before}},
 +          {ExitRoundTransformer, {:after_tool_round, :callback_exit}, {:after_tool_round_exited, :before}},
-+          {InvalidRoundTransformer, {:after_tool_round, {:invalid_callback_result, {:feedback, "should-not-be-legal"}}},
-+           {:after_tool_round_invalid, :before}}
++          {InvalidRoundTransformer, {:after_tool_round, :invalid_callback_result}, {:after_tool_round_invalid, :before}}
 +        ] do
 +      :persistent_term.erase({__MODULE__, :llm_call_count})
 +      test_pid = self()
@@ -873,6 +878,52 @@ index bc700210..967d1f44 100644
 +
 +    assert_receive {:after_tool_round_raised, :before}, 3_000
 +    assert_received_all.(leak_events, "SECRET_BOOM_DETAIL")
++  end
++
++  test "invalid after_tool_round return fails without echoing its body" do
++    parent = self()
++    :persistent_term.erase({__MODULE__, :llm_call_count})
++
++    Mimic.stub(ReqLLM.Generation, :stream_text, fn model, _messages, _opts ->
++      case next_llm_call() do
++        1 ->
++          {:ok,
++           responses_stream_response(
++             [ReqLLM.StreamChunk.tool_call("calculator", %{"a" => 1, "b" => 5}, %{id: "inv1"})],
++             %{finish_reason: :tool_calls},
++             model
++           )}
++
++        other ->
++          raise "unexpected llm call #{other}"
++      end
++    end)
++
++    config =
++      Config.new(%{
++        model: :capable,
++        tools: %{"calculator" => CalculatorTool},
++        request_transformer: InvalidRoundTransformer
++      })
++
++    events =
++      ReAct.stream("invalid return leak", config, context: %{test_pid: parent})
++      |> Enum.to_list()
++
++    assert_receive {:after_tool_round_invalid, :before}, 3_000
++
++    failure = Enum.find(events, &(&1.kind == :request_failed))
++    assert failure, "expected request_failed, got: #{inspect(Enum.map(events, & &1.kind))}"
++    assert failure.data.error == {:after_tool_round, :invalid_callback_result}
++    assert failure.data.error_type == :after_tool_round
++
++    # Neither the failure event nor any other serialized event echoes the
++    # invalid return body, and no further provider call happens.
++    serialized = Enum.map_join(events, "\n", &inspect/1)
++    refute serialized =~ "SECRET_RETURN_DETAIL"
++    refute serialized =~ "candidate"
++    assert llm_call_count() == 1
++    refute Enum.any?(events, &(&1.kind == :request_completed))
 +  end
 +
 +  test "missing task results become incomplete_tool_round without calling the callback" do
