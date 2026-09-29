@@ -44,9 +44,13 @@ tools/patches check HEAD                        # fails if upstream moved under 
 tools/patches apply                             # stops at the first conflicting patch k
 # resolve the conflict markers, then:
 tools/patches rebuild k
-tools/patches reset && tools/patches check
+tools/patches check
 git add patches && git commit
+tools/patches reset
 ```
+
+(Commit rebuilt patches **before** `reset` — it refuses to run while
+`patches/` differs from HEAD, so a rebuild can't be lost by accident.)
 
 ### CI is red (`patches` workflow)
 
@@ -57,22 +61,35 @@ schedule. It checks:
 - `check upstream/main` — upstream moved under a patch → run the *Sync from
   upstream* flow above and push the re-exported patches.
 
-### Publish to hex (`jido_ai_twpatch`) — via CI
+### Versioning and publishing — via CI
 
-The fork owns an independent version line on hex: it starts at `2.3.1`
-(upstream base `2.3.0` + this fork's first release) and the patch segment
-increments on every release. The single source of truth is `@version` in
-`mix.exs` **of the patched tree**, owned by `patches/0003-release-version.patch`
-(the only patch allowed to touch `@version`; when upstream bumps its own
-version, that conflict lands here — resolve by keeping the fork's number).
+Fork versions encode **which upstream version they track** plus our own
+release counter, expressed as a SemVer prerelease:
+
+```
+2.3.0-1    based on upstream 2.3.0, our 1st release
+2.3.0-2    same base, our 2nd release
+2.4.0-1    after syncing upstream 2.4.0 — the counter resets to 1
+```
+
+Plain numeric suffixes keep ordering numeric (`2.3.0-2 < 2.3.0-10`) and the
+base dominates (`2.3.0-10 < 2.4.0-1`). These are prereleases, so consumers
+must pin them explicitly (`== 2.3.0-1`); `mix.lock` keeps the exact pin after
+the first resolve.
+
+Single source of truth: `@version` in the **patched** `mix.exs`, owned by
+`patches/0003-release-version.patch` — the only patch allowed to touch
+`@version`. When upstream bumps its own version, that conflict lands here:
+resolve to the new base and reset the counter to `-1`.
 
 ```sh
 tools/patches apply            # full stack
-# edit @version in mix.exs, e.g. 2.3.1 -> 2.3.2
+# edit @version in mix.exs, e.g. 2.3.0-1 -> 2.3.0-2
 tools/patches rebuild 3        # re-exports the release patch in place
-tools/patches reset && tools/patches check
-git add patches && git commit -m "chore: release 2.3.2"
-git tag v2.3.2 && git push origin main v2.3.2
+tools/patches check
+git add patches && git commit -m "chore: release 2.3.0-2"
+tools/patches reset
+git tag v2.3.0-2 && git push origin main v2.3.0-2
 ```
 
 The `publish` workflow (tag push `v*`) then applies the stack, **verifies the
