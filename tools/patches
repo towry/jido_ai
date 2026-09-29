@@ -150,7 +150,10 @@ cmd_apply() {
     fi
     echo "applied ${PATCHES[$i]}"
   done
-  echo "worktree is now patched; 'tools/patches reset' restores clean main"
+  # --3way stages what it applies; unstage so a bare `git commit` can never
+  # ship patched upstream files. Only explicitly `git add`ed paths commit.
+  git reset -q
+  echo "worktree is now patched (all changes unstaged); 'tools/patches reset' restores clean main"
 }
 
 cmd_reset() {
@@ -216,7 +219,10 @@ cmd_rebuild() {
     fi
     echo "re-applied ${PATCHES[$i]}"
   done
-  echo "stack rebuilt and fully applied; run 'tools/patches check' then commit, or 'tools/patches reset'"
+  # Never leave the patched upstream files staged: `git commit` without a
+  # pathspec would commit them. Everything stays worktree-only.
+  git reset -q
+  echo "stack rebuilt and fully applied (all changes unstaged); next: 'tools/patches check', then 'git add patches && git commit', or 'tools/patches reset'"
 }
 
 cmd_list() {
