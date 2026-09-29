@@ -45,3 +45,6 @@ jido_ai-*.tar
 # OS
 .DS_Store
 Thumbs.db
+
+# Amp orb portals
+.amp/portals/*
