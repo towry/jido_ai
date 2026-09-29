@@ -1,0 +1,1254 @@
+diff --git a/lib/jido_ai/reasoning/react/request_transformer.ex b/lib/jido_ai/reasoning/react/request_transformer.ex
+index c87c0581..16a6ca36 100644
+--- a/lib/jido_ai/reasoning/react/request_transformer.ex
++++ b/lib/jido_ai/reasoning/react/request_transformer.ex
+@@ -81,6 +81,78 @@ defmodule Jido.AI.Reasoning.ReAct.RequestTransformer do
+   @callback transform_request(request(), State.t(), Config.t(), map()) ::
+               {:ok, overrides()} | {:error, term()}
+ 
++  @typedoc """
++  One completed tool call inside a `t:tool_round/0` snapshot.
++
++  `result` is the native normalized tuple produced the same way the strategy
++  projects `:tool_completed` results:
++  `Jido.AI.Error.normalize_result(result, :tool_error, "Tool execution failed")`
++  — never the JSON/string rendering the model sees.
++  """
++  @type tool_round_call :: %{
++          required(:id) => String.t(),
++          required(:name) => String.t(),
++          required(:arguments) => map(),
++          required(:result) => {:ok, term(), [term()]} | {:error, Jido.AI.Error.error_envelope(), [term()]},
++          required(:attempts) => non_neg_integer(),
++          optional(:duration_ms) => non_neg_integer() | nil
++        }
++
++  @typedoc """
++  Snapshot of one completed tool round.
++
++  * `iteration` — number of the round that just completed, starting at 1.
++  * `calls` — every call of this round only, in the order the model emitted
++    them (independent of completion order). Failed calls are kept; calls are
++    never deduplicated. Cross-round accumulation is the caller's concern.
++  """
++  @type tool_round :: %{
++          required(:request_id) => String.t(),
++          required(:run_id) => String.t(),
++          required(:iteration) => pos_integer(),
++          required(:calls) => [tool_round_call()]
++        }
++
++  @doc """
++  Synchronously observe a fully joined tool round.
++
++  Invoked after every parallel tool task of the round has joined, after the
++  native tool results are written to context and events, and after the runtime
++  context state snapshot evolves — but before the `:after_tools` checkpoint
++  and before the loop decides whether to continue or stop at
++  `max_iterations`. The last allowed round still runs this callback; it never
++  extends the iteration budget or triggers an extra model request.
++
++  `state` already contains this round's tool results; `runtime_context` is the
++  unchanged runtime context of the request (no parent projection copy).
++
++  Return values:
++
++  * `:ok` — continue the existing flow unchanged.
++  * `{:error, reason}` — fail the request through the existing failure path,
++    wrapped exactly once as `{:after_tool_round, reason}`.
++
++  Raises, throws, exits and invalid returns become stable typed failures
++  (`:callback_exception`, `:callback_throw`, `:callback_exit`,
++  `{:invalid_callback_result, other}`); exception messages and stacktraces are
++  never placed into the failure reason or model-visible output.
++
++  To push corrective feedback to the next model turn, enqueue it on
++  `config.pending_input_server` via `Jido.AI.PendingInputServer.enqueue/2` and
++  return `:ok`; the native drain injects it into the very next request and
++  emits `input_injected`. This callback has no `{:feedback, ...}` return and
++  never appends to the conversation itself.
++
++  If a tool task exits without leaving a recoverable result while this callback
++  is enabled, the request fails with `{:incomplete_tool_round, detail}` before
++  the callback runs — incomplete rounds are never presented as complete.
++
++  Modules that only implement `transform_request/4` keep the previous
++  behavior; this callback is optional and adds no configuration key.
++  """
++  @callback after_tool_round(tool_round(), State.t(), Config.t(), map()) ::
++              :ok | {:error, term()}
++
+   @doc """
+   Transform the final tool definitions sent to the LLM on each turn.
+ 
+@@ -100,5 +172,5 @@ defmodule Jido.AI.Reasoning.ReAct.RequestTransformer do
+   @callback transform_tool_definitions([ReqLLM.Tool.t()], State.t(), Config.t(), map()) ::
+               {:ok, [ReqLLM.Tool.t()]} | {:error, term()}
+ 
+-  @optional_callbacks transform_tool_definitions: 4
++  @optional_callbacks transform_tool_definitions: 4, after_tool_round: 4
+ end
+diff --git a/lib/jido_ai/reasoning/react/runner.ex b/lib/jido_ai/reasoning/react/runner.ex
+index 6fcbb1fd..95430f90 100644
+--- a/lib/jido_ai/reasoning/react/runner.ex
++++ b/lib/jido_ai/reasoning/react/runner.ex
+@@ -814,15 +814,33 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
+ 
+           case transformed_results do
+             {:ok, state, updated_context, completed_results} ->
+-              state =
+-                state
+-                |> State.put_status(:running)
+-                |> State.clear_pending_tools()
+-                |> State.inc_iteration()
+-                |> Map.put(:context, updated_context)
++              ordered_results = Enum.reverse(completed_results)
++
++              case verify_round_completeness(config, pending, ordered_results) do
++                :ok ->
++                  completed_iteration = state.iteration
++
++                  state =
++                    state
++                    |> State.put_status(:running)
++                    |> State.clear_pending_tools()
++                    |> State.inc_iteration()
++                    |> Map.put(:context, updated_context)
++
++                  next_context = evolve_context_state_snapshot(context, ordered_results)
++
++                  case maybe_after_tool_round(config, state, context, completed_iteration, ordered_results) do
++                    :ok ->
++                      {state, _token} = emit_checkpoint(state, owner, ref, config, :after_tools)
++                      {:ok, state, next_context}
+ 
+-              {state, _token} = emit_checkpoint(state, owner, ref, config, :after_tools)
+-              {:ok, state, evolve_context_state_snapshot(context, Enum.reverse(completed_results))}
++                    {:error, reason} ->
++                      {:error, State.put_status(state, :failed), reason, :after_tool_round}
++                  end
++
++                {:error, reason} ->
++                  {:error, State.put_status(state, :failed), reason, :after_tool_round}
++              end
+ 
+             {:error, state, reason} ->
+               {:error, State.put_status(state, :failed), reason, :tool_interceptor}
+@@ -877,6 +895,98 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
+ 
+   defp maybe_after_tool_call(_agent_module, _tool_call, result, _context), do: {:ok, Effects.normalize_result(result)}
+ 
++  defp after_tool_round_enabled?(%Config{request_transformer: nil}), do: false
++
++  defp after_tool_round_enabled?(%Config{request_transformer: module}),
++    do: function_exported?(module, :after_tool_round, 4)
++
++  # A task exit inside the parallel stream is currently logged and dropped by
++  # the result reduce. When an after_tool_round callback is enabled the
++  # application must never receive a partial round as if it were complete, so
++  # identity is checked against the original pending list before continuing.
++  defp verify_round_completeness(config, pending, ordered_results) do
++    if after_tool_round_enabled?(config) do
++      pending_ids = Enum.map(pending, & &1.id)
++
++      completed_ids =
++        Enum.map(ordered_results, fn
++          {pending_call, _result, _attempts, _duration_ms} -> pending_call.id
++          _other -> nil
++        end)
++        |> Enum.reject(&is_nil/1)
++
++      missing = pending_ids -- completed_ids
++
++      if missing == [] do
++        :ok
++      else
++        {:error,
++         {:incomplete_tool_round, %{missing_ids: missing, pending_ids: pending_ids, completed_ids: completed_ids}}}
++      end
++    else
++      :ok
++    end
++  end
++
++  # Synchronous join hook: runs in the runner process, no background task.
++  defp maybe_after_tool_round(%Config{request_transformer: nil}, _state, _runtime_context, _iteration, _results),
++    do: :ok
++
++  defp maybe_after_tool_round(
++         %Config{request_transformer: module} = config,
++         state,
++         runtime_context,
++         completed_iteration,
++         ordered_results
++       ) do
++    if function_exported?(module, :after_tool_round, 4) do
++      round = build_tool_round(state, completed_iteration, ordered_results)
++
++      try do
++        case module.after_tool_round(round, state, config, runtime_context) do
++          :ok ->
++            :ok
++
++          {:error, reason} ->
++            {:error, {:after_tool_round, reason}}
++
++          other ->
++            {:error, {:after_tool_round, {:invalid_callback_result, other}}}
++        end
++      catch
++        :error, _ -> {:error, {:after_tool_round, :callback_exception}}
++        :throw, _ -> {:error, {:after_tool_round, :callback_throw}}
++        :exit, _ -> {:error, {:after_tool_round, :callback_exit}}
++      end
++    else
++      :ok
++    end
++  end
++
++  defp build_tool_round(%State{} = state, completed_iteration, ordered_results) do
++    %{
++      request_id: state.request_id,
++      run_id: state.run_id,
++      iteration: completed_iteration,
++      calls:
++        Enum.map(ordered_results, fn
++          {pending_call, result, attempts, duration_ms} ->
++            %{
++              id: pending_call.id,
++              name: pending_call.name,
++              arguments: pending_call.arguments,
++              result: Error.normalize_result(result, :tool_error, "Tool execution failed"),
++              attempts: attempts,
++              duration_ms: duration_ms
++            }
++
++          _other ->
++            nil
++        end)
++        |> Enum.reject(&is_nil/1)
++    }
++  end
++
+   defp tool_call_from_pending(%PendingToolCall{} = pending_call) do
+     %{
+       id: pending_call.id,
+diff --git a/test/jido_ai/react/runtime_runner_test.exs b/test/jido_ai/react/runtime_runner_test.exs
+index bc700210..967d1f44 100644
+--- a/test/jido_ai/react/runtime_runner_test.exs
++++ b/test/jido_ai/react/runtime_runner_test.exs
+@@ -2926,6 +2926,1003 @@ defmodule Jido.AI.Reasoning.ReAct.RuntimeRunnerTest do
+     |> Enum.map(&Enum.join/1)
+   end
+ 
++  # --- after_tool_round join-hook fixtures -------------------------------
++
++  defmodule RvSlowTool do
++    use Jido.Action,
++      name: "rv_slow",
++      description: "blocks until the test releases it",
++      schema: Zoi.object(%{})
++
++    def run(_params, context) do
++      target = context[:rv_target]
++      send(target, {:rv_running, :slow, self()})
++
++      receive do
++        {:rv_go, :slow} -> :ok
++      end
++
++      send(target, {:rv_finished, :slow})
++
++      {:ok, %{leg: :slow}, [%Jido.Agent.StateOp.SetState{attrs: %{rv_slow_done: true}}]}
++    end
++  end
++
++  defmodule RvFastTool do
++    use Jido.Action,
++      name: "rv_fast",
++      description: "blocks until the test releases it",
++      schema: Zoi.object(%{})
++
++    def run(_params, context) do
++      target = context[:rv_target]
++      send(target, {:rv_running, :fast, self()})
++
++      receive do
++        {:rv_go, :fast} -> :ok
++      end
++
++      send(target, {:rv_finished, :fast})
++
++      {:ok, %{leg: :fast}, [%Jido.Agent.StateOp.SetState{attrs: %{rv_fast_done: true}}]}
++    end
++  end
++
++  defmodule RvProbeTool do
++    use Jido.Action,
++      name: "rv_probe",
++      description: "requires a value parameter",
++      schema: Zoi.object(%{value: Zoi.integer()})
++
++    def run(%{value: value}, context) do
++      send(context[:rv_target], {:probe_ran, value})
++      {:ok, %{value: value}}
++    end
++  end
++
++  defmodule SelfKillTool do
++    use Jido.Action,
++      name: "self_kill",
++      description: "marks a task that dies before returning a result",
++      schema: Zoi.object(%{})
++
++    def run(_params, _context) do
++      {:ok, %{self_kill_marker: true}}
++    end
++  end
++
++  defmodule RoundSpyTransformer do
++    def transform_request(request, _state, _config, runtime_context) do
++      send(runtime_context[:test_pid], {:transform_request_ctx, self(), runtime_context})
++      {:ok, %{}}
++    end
++
++    def after_tool_round(round, state, config, runtime_context) do
++      send(runtime_context[:test_pid], {:after_tool_round, self(), round, state, config, runtime_context})
++
++      if runtime_context[:hold_callback] do
++        receive do
++          :cb_go -> :ok
++        end
++      end
++
++      :ok
++    end
++  end
++
++  defmodule RejectRoundTransformer do
++    def transform_request(request, _state, _config, _runtime_context), do: {:ok, %{}}
++
++    def after_tool_round(round, _state, _config, runtime_context) do
++      send(runtime_context[:test_pid], {:after_tool_round_rejected, round.iteration})
++      {:error, :domain_violation}
++    end
++  end
++
++  defmodule RaiseRoundTransformer do
++    def transform_request(request, _state, _config, _runtime_context), do: {:ok, %{}}
++
++    def after_tool_round(_round, _state, _config, runtime_context) do
++      send(runtime_context[:test_pid], {:after_tool_round_raised, :before})
++      raise "SECRET_BOOM_DETAIL"
++    end
++  end
++
++  defmodule ThrowRoundTransformer do
++    def transform_request(request, _state, _config, _runtime_context), do: {:ok, %{}}
++
++    def after_tool_round(_round, _state, _config, runtime_context) do
++      send(runtime_context[:test_pid], {:after_tool_round_threw, :before})
++      throw(:bad_callback_throw)
++    end
++  end
++
++  defmodule ExitRoundTransformer do
++    def transform_request(request, _state, _config, _runtime_context), do: {:ok, %{}}
++
++    def after_tool_round(_round, _state, _config, runtime_context) do
++      send(runtime_context[:test_pid], {:after_tool_round_exited, :before})
++      exit(:callback_process_exit)
++    end
++  end
++
++  defmodule InvalidRoundTransformer do
++    def transform_request(request, _state, _config, _runtime_context), do: {:ok, %{}}
++
++    def after_tool_round(_round, _state, _config, runtime_context) do
++      send(runtime_context[:test_pid], {:after_tool_round_invalid, :before})
++      {:feedback, "should-not-be-legal"}
++    end
++  end
++
++  defmodule OldStyleTransformer do
++    def transform_request(request, _state, _config, runtime_context) do
++      send(runtime_context[:test_pid], {:old_style_transform, :called})
++      {:ok, %{}}
++    end
++  end
++
++  defmodule EnqueueRoundTransformer do
++    def transform_request(request, _state, _config, _runtime_context), do: {:ok, %{}}
++
++    def after_tool_round(round, _state, config, runtime_context) do
++      server = config.pending_input_server
++      :ok = PendingInputServer.enqueue(server, %{content: "unrelated pending note", source: "pre"})
++
++      :ok =
++        PendingInputServer.enqueue(server, %{
++          content: "domain feedback for round #{round.iteration}",
++          source: "validator"
++        })
++
++      send(runtime_context[:test_pid], {:after_tool_round_enqueued, round.iteration})
++      :ok
++    end
++  end
++
++  test "after_tool_round fires once after the full parallel join with model-order calls" do
++    parent = self()
++    :persistent_term.erase({__MODULE__, :llm_call_count})
++
++    Mimic.stub(ReqLLM.Generation, :stream_text, fn model, _messages, _opts ->
++      case next_llm_call() do
++        1 ->
++          {:ok,
++           responses_stream_response(
++             [
++               ReqLLM.StreamChunk.tool_call("rv_slow", %{}, %{id: "rv_a"}),
++               ReqLLM.StreamChunk.tool_call("rv_fast", %{}, %{id: "rv_b"})
++             ],
++             %{finish_reason: :tool_calls},
++             model
++           )}
++
++        2 ->
++          {:ok, responses_stream_response([ReqLLM.StreamChunk.text("both done")], %{finish_reason: :stop}, model)}
++
++        other ->
++          raise "unexpected llm call #{other}"
++      end
++    end)
++
++    config =
++      Config.new(%{
++        model: :capable,
++        tools: %{"rv_slow" => RvSlowTool, "rv_fast" => RvFastTool},
++        request_transformer: RoundSpyTransformer
++      })
++
++    task =
++      Task.async(fn ->
++        ReAct.stream("run both legs", config,
++          request_id: "req_rva",
++          run_id: "run_rva",
++          context: %{test_pid: parent, rv_target: parent, state: %{}, hold_callback: true}
++        )
++        |> Enum.reduce([], fn event, acc ->
++          send(parent, {:stream_ev, event})
++          [event | acc]
++        end)
++        |> Enum.reverse()
++      end)
++
++    # Both tool tasks must be running concurrently before either completes.
++    assert_receive {:rv_running, :slow, slow_pid}, 3_000
++    assert_receive {:rv_running, :fast, fast_pid}, 3_000
++
++    # Release the fast leg first: completion order is opposite to model order.
++    send(fast_pid, {:rv_go, :fast})
++    assert_receive {:rv_finished, :fast}, 3_000
++    refute_received {:rv_finished, :slow}
++
++    send(slow_pid, {:rv_go, :slow})
++    assert_receive {:rv_finished, :slow}, 3_000
++
++    # The callback runs synchronously in the runner and blocks continuation:
++    # while it is held, no :after_tools checkpoint exists and no next model
++    # request starts. Both are race-free because the runner is stuck here.
++    assert_receive {:after_tool_round, cb_pid, round, state, _config, runtime_context}, 3_000
++    assert llm_call_count() == 1
++    refute_received {:stream_ev, %{kind: :checkpoint, data: %{reason: :after_tools}}}
++    assert_receive {:stream_ev, %{kind: :llm_started}}, 3_000
++    refute_received {:stream_ev, %{kind: :llm_started}}
++    send(cb_pid, :cb_go)
++
++    events = Task.await(task, 15_000)
++    assert Enum.any?(events, &(&1.kind == :request_completed))
++
++    refute_receive {:after_tool_round, _, _, _, _, _}, 200
++
++    # Round snapshot: iteration from 1, calls in model order, not completion order.
++    assert round.request_id == "req_rva"
++    assert round.run_id == "run_rva"
++    assert round.iteration == 1
++    assert Enum.map(round.calls, & &1.id) == ["rv_a", "rv_b"]
++    assert Enum.map(round.calls, & &1.name) == ["rv_slow", "rv_fast"]
++    assert Enum.map(round.calls, & &1.arguments) == [%{}, %{}]
++    assert Enum.map(round.calls, & &1.attempts) == [1, 1]
++    assert Enum.all?(round.calls, &is_integer(&1.duration_ms))
++
++    # Native results use the exact same normalization strategy applies.
++    event_results = tool_result_events(events)
++    assert event_results |> Map.keys() |> Enum.sort() == ["rv_a", "rv_b"]
++
++    for call <- round.calls do
++      assert call.result == Jido.AI.Error.normalize_result(event_results[call.id], :tool_error, "Tool execution failed")
++    end
++
++    assert [{:ok, %{leg: :slow}, [_slow_op]}, {:ok, %{leg: :fast}, [_fast_op]}] =
++             Enum.map(round.calls, & &1.result)
++
++    # state reflects the joined tool results of this round.
++    tool_messages = Enum.filter(AIContext.to_messages(state.context), &(&1.role == :tool))
++    assert length(tool_messages) == 2
++
++    # runtime_context is preserved: same identity fields, same map as the
++    # first transform_request turn, not a copied parent projection.
++    assert runtime_context[:request_id] == "req_rva"
++    assert runtime_context[:run_id] == "run_rva"
++    assert_receive {:transform_request_ctx, first_turn_pid, first_turn_ctx}, 3_000
++    assert_receive {:transform_request_ctx, second_turn_pid, second_turn_ctx}, 3_000
++    # The callback runs in the same process that runs transform_request (the
++    # runner/coordinator) — no background callback task.
++    assert first_turn_pid == cb_pid
++    assert second_turn_pid == cb_pid
++    assert runtime_context == first_turn_ctx
++    assert second_turn_ctx[:request_id] == "req_rva"
++    refute second_turn_ctx == first_turn_ctx
++  end
++
++  test "after_tool_round round snapshots stay per-round with accurate iteration" do
++    parent = self()
++    :persistent_term.erase({__MODULE__, :llm_call_count})
++    :persistent_term.erase({NonRetryTool, :attempts})
++
++    Mimic.stub(ReqLLM.Generation, :stream_text, fn model, _messages, _opts ->
++      case next_llm_call() do
++        1 ->
++          {:ok,
++           responses_stream_response(
++             [ReqLLM.StreamChunk.tool_call("calculator", %{"a" => 1, "b" => 2}, %{id: "b1"})],
++             %{finish_reason: :tool_calls},
++             model
++           )}
++
++        2 ->
++          {:ok,
++           responses_stream_response(
++             [ReqLLM.StreamChunk.tool_call("non_retry_tool", %{"value" => 9}, %{id: "b2"})],
++             %{finish_reason: :tool_calls},
++             model
++           )}
++
++        3 ->
++          {:ok, responses_stream_response([ReqLLM.StreamChunk.text("two rounds done")], %{finish_reason: :stop}, model)}
++
++        other ->
++          raise "unexpected llm call #{other}"
++      end
++    end)
++
++    config =
++      Config.new(%{
++        model: :capable,
++        tools: %{"calculator" => CalculatorTool, "non_retry_tool" => NonRetryTool},
++        request_transformer: RoundSpyTransformer,
++        tool_max_retries: 0
++      })
++
++    events =
++      ReAct.stream("two tool rounds", config, context: %{test_pid: parent})
++      |> Enum.to_list()
++
++    assert Enum.any?(events, &(&1.kind == :request_completed))
++    assert_receive {:after_tool_round, _, round1, _, _, _}, 2_000
++    assert_receive {:after_tool_round, _, round2, _, _, _}, 2_000
++    refute_receive {:after_tool_round, _, _, _, _, _}, 200
++
++    assert round1.iteration == 1
++    assert round2.iteration == 2
++    assert Enum.map(round1.calls, & &1.id) == ["b1"]
++    assert Enum.map(round2.calls, & &1.id) == ["b2"]
++
++    # Each round carries only its own calls; failures are fully recorded.
++    assert [%{id: "b1", result: {:ok, %{result: 3}, _}}] = round1.calls
++    assert [%{id: "b2", result: {:error, _, _}, attempts: 1}] = round2.calls
++
++    event_results = tool_result_events(events)
++
++    assert round2.calls |> hd() |> Map.fetch!(:result) ==
++             Jido.AI.Error.normalize_result(event_results["b2"], :tool_error, "Tool execution failed")
++  end
++
++  test "after_tool_round receives every normally-returnable tool error with strategy parity" do
++    parent = self()
++    :persistent_term.erase({__MODULE__, :llm_call_count})
++    :persistent_term.erase({RetryTool, :attempts})
++    :persistent_term.erase({NonRetryTool, :attempts})
++
++    Mimic.stub(ReqLLM.Generation, :stream_text, fn model, messages, _opts ->
++      case next_llm_call() do
++        1 ->
++          {:ok,
++           responses_stream_response(
++             [
++               ReqLLM.StreamChunk.tool_call("ghost_tool", %{}, %{id: "g1"}),
++               ReqLLM.StreamChunk.tool_call("rv_probe", %{}, %{id: "p1"}),
++               ReqLLM.StreamChunk.tool_call("non_retry_tool", %{"value" => 1}, %{id: "e1"}),
++               ReqLLM.StreamChunk.tool_call("retry_tool", %{"value" => 7}, %{id: "r1"})
++             ],
++             %{finish_reason: :tool_calls},
++             model
++           )}
++
++        2 ->
++          send(parent, {:llm_messages, 2, messages})
++          {:ok, responses_stream_response([ReqLLM.StreamChunk.text("catalogue done")], %{finish_reason: :stop}, model)}
++
++        other ->
++          raise "unexpected llm call #{other}"
++      end
++    end)
++
++    config =
++      Config.new(%{
++        model: :capable,
++        tools: %{
++          "rv_probe" => RvProbeTool,
++          "non_retry_tool" => NonRetryTool,
++          "retry_tool" => RetryTool
++        },
++        request_transformer: RoundSpyTransformer,
++        tool_max_retries: 1
++      })
++
++    events =
++      ReAct.stream("error catalogue", config, context: %{test_pid: parent, rv_target: parent})
++      |> Enum.to_list()
++
++    assert Enum.any?(events, &(&1.kind == :request_completed))
++    refute_receive {:probe_ran, _}, 200
++
++    assert_receive {:after_tool_round, _, round, _, _, _}, 2_000
++    assert round.iteration == 1
++    assert Enum.map(round.calls, & &1.id) == ["g1", "p1", "e1", "r1"]
++
++    [ghost, probe, plain_error, retried] = round.calls
++    assert {:error, %{type: :unknown_tool}, []} = ghost.result
++    assert ghost.attempts == 1
++    assert {:error, _, _} = probe.result
++    assert probe.attempts == 1
++    assert {:error, _, _} = plain_error.result
++    assert plain_error.attempts == 1
++    assert {:ok, %{attempt: 2}, _effects} = retried.result
++    assert retried.attempts == 2
++
++    # Parity with strategy's :tool_completed normalization for every call.
++    event_results = tool_result_events(events)
++    assert map_size(event_results) == 4
++
++    for call <- round.calls do
++      assert call.result == Jido.AI.Error.normalize_result(event_results[call.id], :tool_error, "Tool execution failed")
++    end
++
++    # The native model-feedback path still carries every tool result.
++    assert_receive {:llm_messages, 2, second_turn_messages}, 3_000
++    tool_ids = second_turn_messages |> Enum.filter(&(&1.role in [:tool, "tool"])) |> Enum.map(& &1.tool_call_id)
++    assert Enum.sort(tool_ids) == ["e1", "g1", "p1", "r1"]
++  end
++
++  test "after_tool_round feedback enqueued via PendingInputServer reaches the very next request" do
++    parent = self()
++    :persistent_term.erase({__MODULE__, :llm_call_count})
++    {:ok, server} = PendingInputServer.start_link(owner: self(), request_id: "req_feedback")
++
++    Mimic.stub(ReqLLM.Generation, :stream_text, fn model, messages, _opts ->
++      case next_llm_call() do
++        1 ->
++          {:ok,
++           responses_stream_response(
++             [ReqLLM.StreamChunk.tool_call("calculator", %{"a" => 5, "b" => 6}, %{id: "f1"})],
++             %{finish_reason: :tool_calls},
++             model
++           )}
++
++        2 ->
++          send(parent, {:llm_messages, 2, messages})
++
++          {:ok,
++           responses_stream_response([ReqLLM.StreamChunk.text("corrected answer")], %{finish_reason: :stop}, model)}
++
++        other ->
++          raise "unexpected llm call #{other}"
++      end
++    end)
++
++    config =
++      Config.new(%{
++        model: :capable,
++        tools: %{"calculator" => CalculatorTool},
++        request_transformer: EnqueueRoundTransformer,
++        pending_input_server: server
++      })
++
++    events =
++      ReAct.stream("validator feedback", config, context: %{test_pid: parent})
++      |> Enum.to_list()
++
++    assert_receive {:after_tool_round_enqueued, 1}, 3_000
++    assert_receive {:llm_messages, 2, second_turn_messages}, 3_000
++
++    # Both the unrelated pending input and the feedback arrive together, once each.
++    assert message_occurrences(second_turn_messages, "unrelated pending note") == 1
++    assert message_occurrences(second_turn_messages, "domain feedback for round 1") == 1
++
++    injected =
++      events
++      |> Enum.filter(&(&1.kind == :input_injected))
++      |> Enum.map(& &1.data.content)
++
++    assert injected == ["unrelated pending note", "domain feedback for round 1"]
++    assert llm_call_count() == 2
++
++    completed = Enum.find(events, &(&1.kind == :request_completed))
++    assert completed.data.result == "corrected answer"
++    assert Enum.any?(events, &(&1.kind == :checkpoint and &1.data.reason == :after_tools))
++  end
++
++  test "after_tool_round runs on the final allowed round without a max_iterations+1 request" do
++    parent = self()
++    :persistent_term.erase({__MODULE__, :llm_call_count})
++    {:ok, server} = PendingInputServer.start_link(owner: self(), request_id: "req_max_ok")
++
++    Mimic.stub(ReqLLM.Generation, :stream_text, fn model, _messages, _opts ->
++      case next_llm_call() do
++        1 ->
++          {:ok,
++           responses_stream_response(
++             [ReqLLM.StreamChunk.tool_call("calculator", %{"a" => 4, "b" => 4}, %{id: "m1"})],
++             %{finish_reason: :tool_calls},
++             model
++           )}
++
++        other ->
++          raise "unexpected llm call #{other} (max_iterations budget exceeded)"
++      end
++    end)
++
++    config =
++      Config.new(%{
++        model: :capable,
++        tools: %{"calculator" => CalculatorTool},
++        request_transformer: EnqueueRoundTransformer,
++        pending_input_server: server,
++        max_iterations: 1
++      })
++
++    events =
++      ReAct.stream("last round boundary", config, context: %{test_pid: parent})
++      |> Enum.to_list()
++
++    assert_receive {:after_tool_round_enqueued, 1}, 3_000
++    refute_receive {:after_tool_round_enqueued, _}, 200
++    assert llm_call_count() == 1
++
++    completed = Enum.find(events, &(&1.kind == :request_completed))
++    assert completed.data.termination_reason == :max_iterations
++    assert Enum.count(events, &(&1.kind == :llm_started)) == 1
++  end
++
++  test "after_tool_round rejection fails the request on the final allowed round without another request" do
++    parent = self()
++    :persistent_term.erase({__MODULE__, :llm_call_count})
++
++    Mimic.stub(ReqLLM.Generation, :stream_text, fn model, _messages, _opts ->
++      case next_llm_call() do
++        1 ->
++          {:ok,
++           responses_stream_response(
++             [ReqLLM.StreamChunk.tool_call("calculator", %{"a" => 1, "b" => 1}, %{id: "m2"})],
++             %{finish_reason: :tool_calls},
++             model
++           )}
++
++        other ->
++          raise "unexpected llm call #{other} (max_iterations budget exceeded)"
++      end
++    end)
++
++    config =
++      Config.new(%{
++        model: :capable,
++        tools: %{"calculator" => CalculatorTool},
++        request_transformer: RejectRoundTransformer,
++        max_iterations: 1
++      })
++
++    events =
++      ReAct.stream("reject at boundary", config, context: %{test_pid: parent})
++      |> Enum.to_list()
++
++    assert_receive {:after_tool_round_rejected, 1}, 3_000
++    refute_receive {:after_tool_round_rejected, _}, 200
++    assert llm_call_count() == 1
++
++    failure = Enum.find(events, &(&1.kind == :request_failed))
++    assert failure.data.error == {:after_tool_round, :domain_violation}
++    assert failure.data.error_type == :after_tool_round
++    refute Enum.any?(events, &(&1.kind == :request_completed))
++  end
++
++  test "after_tool_round raise, throw, exit and invalid returns fail as stable typed errors" do
++    for {transformer, expected_error, marker} <- [
++          {RaiseRoundTransformer, {:after_tool_round, :callback_exception}, {:after_tool_round_raised, :before}},
++          {ThrowRoundTransformer, {:after_tool_round, :callback_throw}, {:after_tool_round_threw, :before}},
++          {ExitRoundTransformer, {:after_tool_round, :callback_exit}, {:after_tool_round_exited, :before}},
++          {InvalidRoundTransformer, {:after_tool_round, {:invalid_callback_result, {:feedback, "should-not-be-legal"}}},
++           {:after_tool_round_invalid, :before}}
++        ] do
++      :persistent_term.erase({__MODULE__, :llm_call_count})
++      test_pid = self()
++
++      Mimic.stub(ReqLLM.Generation, :stream_text, fn model, _messages, _opts ->
++        case next_llm_call() do
++          1 ->
++            {:ok,
++             responses_stream_response(
++               [ReqLLM.StreamChunk.tool_call("calculator", %{"a" => 1, "b" => 2}, %{id: "err1"})],
++               %{finish_reason: :tool_calls},
++               model
++             )}
++
++          other ->
++            raise "unexpected llm call #{other}"
++        end
++      end)
++
++      config =
++        Config.new(%{
++          model: :capable,
++          tools: %{"calculator" => CalculatorTool},
++          request_transformer: transformer
++        })
++
++      events =
++        ReAct.stream("callback failure taxonomy", config, context: %{test_pid: test_pid})
++        |> Enum.to_list()
++
++      assert_receive ^marker, 3_000
++      failure = Enum.find(events, &(&1.kind == :request_failed))
++      assert failure, "expected request_failed for #{inspect(transformer)}"
++      assert failure.data.error == expected_error
++      assert failure.data.error_type == :after_tool_round
++      refute Enum.any?(events, &(&1.kind == :request_completed))
++      assert llm_call_count() == 1
++    end
++
++    # Exception text must not leak into any serialized event.
++    assert_received_all = fn events, needle ->
++      serialized = Enum.map_join(events, "\n", &inspect/1)
++      refute serialized =~ needle
++    end
++
++    # Re-run raise case in isolation to inspect its serialized events.
++    :persistent_term.erase({__MODULE__, :llm_call_count})
++    test_pid = self()
++
++    Mimic.stub(ReqLLM.Generation, :stream_text, fn model, _messages, _opts ->
++      case next_llm_call() do
++        1 ->
++          {:ok,
++           responses_stream_response(
++             [ReqLLM.StreamChunk.tool_call("calculator", %{"a" => 1, "b" => 2}, %{id: "errleak"})],
++             %{finish_reason: :tool_calls},
++             model
++           )}
++
++        other ->
++          raise "unexpected llm call #{other}"
++      end
++    end)
++
++    leak_config =
++      Config.new(%{
++        model: :capable,
++        tools: %{"calculator" => CalculatorTool},
++        request_transformer: RaiseRoundTransformer
++      })
++
++    leak_events =
++      ReAct.stream("no exception leak", leak_config, context: %{test_pid: test_pid})
++      |> Enum.to_list()
++
++    assert_receive {:after_tool_round_raised, :before}, 3_000
++    assert_received_all.(leak_events, "SECRET_BOOM_DETAIL")
++  end
++
++  test "missing task results become incomplete_tool_round without calling the callback" do
++    parent = self()
++    :persistent_term.erase({__MODULE__, :llm_call_count})
++
++    Mimic.stub(ReqLLM.Generation, :stream_text, fn model, _messages, _opts ->
++      case next_llm_call() do
++        1 ->
++          {:ok,
++           responses_stream_response(
++             [
++               ReqLLM.StreamChunk.tool_call("self_kill", %{}, %{id: "k1"}),
++               ReqLLM.StreamChunk.tool_call("calculator", %{"a" => 3, "b" => 4}, %{id: "c1"})
++             ],
++             %{finish_reason: :tool_calls},
++             model
++           )}
++
++        other ->
++          raise "unexpected llm call #{other}"
++      end
++    end)
++
++    config =
++      Config.new(%{
++        model: :capable,
++        tools: %{"self_kill" => SelfKillTool, "calculator" => CalculatorTool},
++        request_transformer: RoundSpyTransformer
++      })
++
++    # The executor absorbs every exception/exit raised inside a tool call, so a
++    # task cannot die through the public tool API (verified: :kill propagates
++    # through the async_stream link and takes the caller down, while every
++    # catchable exit is converted to a normal error result). Error.retryable?/1
++    # is the first call of the tool pipeline outside safe_execute's catch —
++    # exiting :normal there makes async_stream yield {:exit, :normal} for that
++    # task (caller survives) exactly as a real task exit would.
++    Mimic.stub(Jido.AI.Error, :retryable?, fn
++      {:ok, %{self_kill_marker: true}, _effects} -> exit(:normal)
++      {:ok, %{self_kill_marker: true}} -> exit(:normal)
++      _other -> false
++    end)
++
++    events =
++      ReAct.stream("infrastructure gap", config, context: %{test_pid: parent})
++      |> Enum.to_list()
++
++    failure = Enum.find(events, &(&1.kind == :request_failed))
++    assert failure, "no request_failed; events: #{inspect(Enum.map(events, & &1.kind))}"
++
++    assert failure.data.error ==
++             {:incomplete_tool_round, %{missing_ids: ["k1"], pending_ids: ["k1", "c1"], completed_ids: ["c1"]}}
++
++    assert failure.data.error_type == :after_tool_round
++
++    refute_receive {:after_tool_round, _, _, _, _, _}, 300
++    refute Enum.any?(events, &(&1.kind == :request_completed))
++    refute Enum.any?(events, &(&1.kind == :checkpoint and &1.data.reason == :after_tools))
++    assert llm_call_count() == 1
++
++    # The completing sibling call is still a full record in the event stream.
++    assert Map.keys(tool_result_events(events)) == ["c1"]
++  end
++
++  test "ordinary tool errors are delivered to the callback, never as infrastructure failures" do
++    parent = self()
++    :persistent_term.erase({__MODULE__, :llm_call_count})
++    :persistent_term.erase({NonRetryTool, :attempts})
++
++    Mimic.stub(ReqLLM.Generation, :stream_text, fn model, _messages, _opts ->
++      case next_llm_call() do
++        1 ->
++          {:ok,
++           responses_stream_response(
++             [ReqLLM.StreamChunk.tool_call("non_retry_tool", %{"value" => 3}, %{id: "ord1"})],
++             %{finish_reason: :tool_calls},
++             model
++           )}
++
++        2 ->
++          {:ok, responses_stream_response([ReqLLM.StreamChunk.text("ok after error")], %{finish_reason: :stop}, model)}
++
++        other ->
++          raise "unexpected llm call #{other}"
++      end
++    end)
++
++    config =
++      Config.new(%{
++        model: :capable,
++        tools: %{"non_retry_tool" => NonRetryTool},
++        request_transformer: RoundSpyTransformer,
++        tool_max_retries: 0
++      })
++
++    events =
++      ReAct.stream("ordinary tool error", config, context: %{test_pid: parent})
++      |> Enum.to_list()
++
++    assert_receive {:after_tool_round, _, round, _, _, _}, 3_000
++    assert [%{id: "ord1", result: {:error, _, _}}] = round.calls
++    assert Enum.any?(events, &(&1.kind == :request_completed))
++    refute Enum.any?(events, &(&1.kind == :request_failed))
++  end
++
++  test "legacy transformers without after_tool_round keep existing behavior" do
++    parent = self()
++    :persistent_term.erase({__MODULE__, :llm_call_count})
++
++    assert {:ok, OldStyleTransformer} =
++             Jido.AI.Reasoning.ReAct.RequestTransformer.validate(OldStyleTransformer)
++
++    Mimic.stub(ReqLLM.Generation, :stream_text, fn model, _messages, _opts ->
++      case next_llm_call() do
++        1 ->
++          {:ok,
++           responses_stream_response(
++             [ReqLLM.StreamChunk.tool_call("calculator", %{"a" => 2, "b" => 2}, %{id: "l1"})],
++             %{finish_reason: :tool_calls},
++             model
++           )}
++
++        2 ->
++          {:ok, responses_stream_response([ReqLLM.StreamChunk.text("legacy ok")], %{finish_reason: :stop}, model)}
++
++        other ->
++          raise "unexpected llm call #{other}"
++      end
++    end)
++
++    config =
++      Config.new(%{
++        model: :capable,
++        tools: %{"calculator" => CalculatorTool},
++        request_transformer: OldStyleTransformer
++      })
++
++    events =
++      ReAct.stream("legacy transformer", config, context: %{test_pid: parent})
++      |> Enum.to_list()
++
++    assert Enum.any?(events, &(&1.kind == :request_completed))
++    assert_received {:old_style_transform, :called}
++    assert Enum.count(events, &(&1.kind == :tool_completed)) == 1
++    refute_received {:after_tool_round, _, _, _, _, _}
++  end
++
++  test "direct runner entry reuses the same request_transformer config for after_tool_round" do
++    parent = self()
++    :persistent_term.erase({__MODULE__, :llm_call_count})
++
++    Mimic.stub(ReqLLM.Generation, :stream_text, fn model, _messages, _opts ->
++      case next_llm_call() do
++        1 ->
++          {:ok,
++           responses_stream_response(
++             [ReqLLM.StreamChunk.tool_call("calculator", %{"a" => 6, "b" => 7}, %{id: "d1"})],
++             %{finish_reason: :tool_calls},
++             model
++           )}
++
++        2 ->
++          {:ok, responses_stream_response([ReqLLM.StreamChunk.text("direct ok")], %{finish_reason: :stop}, model)}
++
++        other ->
++          raise "unexpected llm call #{other}"
++      end
++    end)
++
++    config =
++      Config.new(%{
++        model: :capable,
++        tools: %{"calculator" => CalculatorTool},
++        request_transformer: RoundSpyTransformer
++      })
++
++    events =
++      Jido.AI.Reasoning.ReAct.Runner.stream("direct runner", config, context: %{test_pid: parent})
++      |> Enum.to_list()
++
++    assert_receive {:after_tool_round, _, round, _, _, _}, 3_000
++    assert round.iteration == 1
++    assert Enum.map(round.calls, & &1.id) == ["d1"]
++    assert Enum.any?(events, &(&1.kind == :request_completed))
++  end
++
++  test "checkpoint events keep their original shape with after_tool_round enabled" do
++    parent = self()
++    :persistent_term.erase({__MODULE__, :llm_call_count})
++
++    Mimic.stub(ReqLLM.Generation, :stream_text, fn model, _messages, _opts ->
++      case next_llm_call() do
++        1 ->
++          {:ok,
++           responses_stream_response(
++             [ReqLLM.StreamChunk.tool_call("calculator", %{"a" => 8, "b" => 1}, %{id: "ck1"})],
++             %{finish_reason: :tool_calls},
++             model
++           )}
++
++        2 ->
++          {:ok, responses_stream_response([ReqLLM.StreamChunk.text("checkpoint ok")], %{finish_reason: :stop}, model)}
++
++        other ->
++          raise "unexpected llm call #{other}"
++      end
++    end)
++
++    config =
++      Config.new(%{
++        model: :capable,
++        tools: %{"calculator" => CalculatorTool},
++        request_transformer: RoundSpyTransformer
++      })
++
++    events =
++      ReAct.stream("checkpoint shape", config, context: %{test_pid: parent})
++      |> Enum.to_list()
++
++    checkpoints = Enum.filter(events, &(&1.kind == :checkpoint))
++    assert checkpoints != []
++    assert Enum.any?(checkpoints, &(&1.data.reason == :after_tools))
++
++    for checkpoint <- checkpoints do
++      assert Enum.sort(Map.keys(checkpoint.data)) == [:reason, :token]
++    end
++  end
++
++  test "consumer halt cancels the request after the callback round without another model call" do
++    parent = self()
++    :persistent_term.erase({__MODULE__, :llm_call_count})
++
++    # Helper releases the rendezvous tools only once both are provably running;
++    # the cancel signal (sent when the consumer halts) is therefore queued
++    # while the runner is still inside the tool round join.
++    helper =
++      spawn(fn ->
++        running =
++          for _ <- 1..2, reduce: [] do
++            acc ->
++              receive do
++                {:rv_running, tag, pid} -> [{tag, pid} | acc]
++              end
++          end
++
++        # Hold BOTH tools until both are provably blocked, so the round cannot
++        # finish on a single signal while the consumer is still scheduling its
++        # halt/cancel. Cancel is queued strictly before round completion: the
++        # :after_llm checkpoint that triggers the halt is sent before the tasks
++        # spawn, and the round then needs both spawns, signals, releases, join
++        # and reduction to complete.
++        for {tag, pid} <- running do
++          send(pid, {:rv_go, tag})
++        end
++      end)
++
++    Mimic.stub(ReqLLM.Generation, :stream_text, fn model, _messages, _opts ->
++      case next_llm_call() do
++        1 ->
++          {:ok,
++           responses_stream_response(
++             [
++               ReqLLM.StreamChunk.tool_call("rv_slow", %{}, %{id: "x1"}),
++               ReqLLM.StreamChunk.tool_call("rv_fast", %{}, %{id: "x2"})
++             ],
++             %{finish_reason: :tool_calls},
++             model
++           )}
++
++        other ->
++          raise "unexpected llm call #{other} (cancel did not stop the run)"
++      end
++    end)
++
++    config =
++      Config.new(%{
++        model: :capable,
++        tools: %{"rv_slow" => RvSlowTool, "rv_fast" => RvFastTool},
++        request_transformer: RoundSpyTransformer
++      })
++
++    # Pull events until the first :after_llm checkpoint (tool round starting),
++    # then halt: Stream.resource cleanup queues {:react_cancel, ref} before the
++    # round can finish, and awaits runner shutdown without deadlocking because
++    # the helper releases both blocked tools.
++    collected =
++      ReAct.stream("cancel boundary", config, context: %{test_pid: parent, rv_target: helper})
++      |> Enum.reduce_while([], fn event, acc ->
++        acc = [event | acc]
++
++        if event.kind == :checkpoint and event.data.reason == :after_llm do
++          {:halt, acc}
++        else
++          {:cont, acc}
++        end
++      end)
++
++    events = Enum.reverse(collected)
++    assert Enum.any?(events, &(&1.kind == :checkpoint and &1.data.reason == :after_llm))
++
++    # Remaining events (callback ran, then cancellation) arrive as raw messages.
++    assert_receive {:after_tool_round, _, round, _, _, _}, 3_000
++    assert round.iteration == 1
++    assert_receive {:react_runner, _ref, :event, %{kind: :request_cancelled}}, 3_000
++    refute_received {:react_runner, _ref2, :event, %{kind: :llm_started}}
++    assert llm_call_count() == 1
++    refute_receive {:after_tool_round, _, _, _, _, _}, 200
++  end
++
++  test "callback rejection seals the pending input server" do
++    parent = self()
++    :persistent_term.erase({__MODULE__, :llm_call_count})
++    {:ok, server} = PendingInputServer.start_link(owner: self(), request_id: "req_seal")
++
++    Mimic.stub(ReqLLM.Generation, :stream_text, fn model, _messages, _opts ->
++      case next_llm_call() do
++        1 ->
++          {:ok,
++           responses_stream_response(
++             [ReqLLM.StreamChunk.tool_call("calculator", %{"a" => 1, "b" => 3}, %{id: "s1"})],
++             %{finish_reason: :tool_calls},
++             model
++           )}
++
++        other ->
++          raise "unexpected llm call #{other}"
++      end
++    end)
++
++    config =
++      Config.new(%{
++        model: :capable,
++        tools: %{"calculator" => CalculatorTool},
++        request_transformer: RejectRoundTransformer,
++        pending_input_server: server
++      })
++
++    events =
++      ReAct.stream("seal on callback failure", config, context: %{test_pid: parent})
++      |> Enum.to_list()
++
++    assert Enum.any?(events, &(&1.kind == :request_failed))
++    assert {:error, :closed} = PendingInputServer.enqueue(server, %{content: "late arrival"})
++  end
++
++  defp next_llm_call do
++    count = :persistent_term.get({__MODULE__, :llm_call_count}, 0) + 1
++    :persistent_term.put({__MODULE__, :llm_call_count}, count)
++    count
++  end
++
++  defp llm_call_count, do: :persistent_term.get({__MODULE__, :llm_call_count}, 0)
++
++  defp message_occurrences(messages, needle) do
++    haystack = Enum.map_join(messages, " ", &inspect/1)
++    haystack |> String.split(needle) |> length() |> Kernel.-(1)
++  end
++
++  defp tool_result_events(events) do
++    events
++    |> Enum.filter(&(&1.kind == :tool_completed))
++    |> Map.new(&{&1.data.tool_call_id, &1.data.result})
++  end
++
+   defp responses_stream_response(chunks, metadata, model_spec, opts \\ []) do
+     {:ok, model} = ReqLLM.model(model_spec)
+     {:ok, metadata_handle} = ReqLLM.StreamResponse.MetadataHandle.start_link(fn -> metadata end)
+diff --git a/test/test_helper.exs b/test/test_helper.exs
+index ced4e44f..1c9cdba5 100644
+--- a/test/test_helper.exs
++++ b/test/test_helper.exs
+@@ -5,5 +5,6 @@ Mimic.copy(ReqLLM.Providers.OpenAI)
+ Mimic.copy(ReqLLM.Providers.OpenAICodex)
+ Mimic.copy(ReqLLM.StreamResponse)
+ Mimic.copy(Jido.AgentServer)
++Mimic.copy(Jido.AI.Error)
+ 
+ ExUnit.start(exclude: [:flaky], capture_log: true)
