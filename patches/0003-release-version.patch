@@ -1,13 +1,13 @@
 diff --git a/mix.exs b/mix.exs
-index 1c828508..98ce3447 100644
+index 270ae51c..7d19646e 100644
 --- a/mix.exs
 +++ b/mix.exs
 @@ -1,7 +1,7 @@
  defmodule JidoAi.MixProject do
    use Mix.Project
  
--  @version "2.3.0"
-+  @version "2.3.0-2"
+-  @version "2.4.0"
++  @version "2.4.0-1"
    @source_url "https://github.com/agentjido/jido_ai"
    @description "AI integration layer for the Jido ecosystem - Actions, Workflows, and LLM orchestration"
    def project do

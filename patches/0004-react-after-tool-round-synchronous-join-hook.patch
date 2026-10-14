@@ -92,10 +92,10 @@ index c87c0581..7a0909a3 100644
 +  @optional_callbacks transform_tool_definitions: 4, after_tool_round: 4
  end
 diff --git a/lib/jido_ai/reasoning/react/runner.ex b/lib/jido_ai/reasoning/react/runner.ex
-index 6fcbb1fd..6165a146 100644
+index e9c9002e..297071ea 100644
 --- a/lib/jido_ai/reasoning/react/runner.ex
 +++ b/lib/jido_ai/reasoning/react/runner.ex
-@@ -814,15 +814,33 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
+@@ -871,15 +871,33 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
  
            case transformed_results do
              {:ok, state, updated_context, completed_results} ->
@@ -137,7 +137,7 @@ index 6fcbb1fd..6165a146 100644
  
              {:error, state, reason} ->
                {:error, State.put_status(state, :failed), reason, :tool_interceptor}
-@@ -877,6 +895,98 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
+@@ -934,6 +952,98 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
  
    defp maybe_after_tool_call(_agent_module, _tool_call, result, _context), do: {:ok, Effects.normalize_result(result)}
  
@@ -237,10 +237,10 @@ index 6fcbb1fd..6165a146 100644
      %{
        id: pending_call.id,
 diff --git a/test/jido_ai/react/runtime_runner_test.exs b/test/jido_ai/react/runtime_runner_test.exs
-index bc700210..3b6294f7 100644
+index 67556bf5..003f2e2e 100644
 --- a/test/jido_ai/react/runtime_runner_test.exs
 +++ b/test/jido_ai/react/runtime_runner_test.exs
-@@ -2926,6 +2926,1051 @@ defmodule Jido.AI.Reasoning.ReAct.RuntimeRunnerTest do
+@@ -3116,6 +3116,1052 @@ defmodule Jido.AI.Reasoning.ReAct.RuntimeRunnerTest do
      |> Enum.map(&Enum.join/1)
    end
  
@@ -1225,11 +1225,12 @@ index bc700210..3b6294f7 100644
 +    events = Enum.reverse(collected)
 +    assert Enum.any?(events, &(&1.kind == :checkpoint and &1.data.reason == :after_llm))
 +
-+    # Remaining events (callback ran, then cancellation) arrive as raw messages.
-+    assert_receive {:after_tool_round, _, round, _, _, _}, 3_000
++    # Callback notifications survive cleanup; runtime stream messages do not.
++    assert_receive {:after_tool_round, runner_pid, round, _, _, _}, 3_000
 +    assert round.iteration == 1
-+    assert_receive {:react_runner, _ref, :event, %{kind: :request_cancelled}}, 3_000
-+    refute_received {:react_runner, _ref2, :event, %{kind: :llm_started}}
++    refute Process.alive?(runner_pid)
++    refute_received {:react_runner, _, _, _}
++    refute_received {:react_runner, _, _}
 +    assert llm_call_count() == 1
 +    refute_receive {:after_tool_round, _, _, _, _, _}, 200
 +  end
