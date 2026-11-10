@@ -1,0 +1,12 @@
+diff --git a/mix.exs b/mix.exs
+index e4edfdd6..1c828508 100644
+--- a/mix.exs
++++ b/mix.exs
+@@ -109,6 +109,7 @@ defmodule JidoAi.MixProject do
+ 
+   defp package do
+     [
++      name: "jido_ai_twpatch",
+       files: [
+         "lib",
+         "mix.exs",

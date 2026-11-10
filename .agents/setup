@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Prepares a fresh orb to build and test jido_ai:
+# precompiled Erlang/OTP + Elixir on PATH, Hex/Rebar archives,
+# fetched deps and a warm compile for the dev/test environments.
+# Idempotent and non-interactive; safe to run repeatedly.
+
+OTP_VERSION="29.1.1"
+ELIXIR_VERSION="1.20.4"
+OTP_OS="ubuntu-22.04" # glibc 2.35 build, runs on Debian 12 (glibc 2.36)
+OTP_PARENT="$HOME/.local/opt/otp"
+OTP_DIR="$OTP_PARENT/OTP-${OTP_VERSION}"
+ELIXIR_PARENT="$HOME/.local/opt/elixir"
+ELIXIR_DIR="$ELIXIR_PARENT/${ELIXIR_VERSION}"
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
+
+log() { printf '[setup] %s\n' "$*"; }
+step_begin() { STEP_T0=$SECONDS; log "$1..."; }
+step_end() { log "$1: $((SECONDS - STEP_T0))s"; }
+
+# ---------------------------------------------------------------- system deps
+# Check first so a warm snapshot never runs apt-get.
+step_begin "system packages"
+missing=()
+command -v curl >/dev/null || missing+=(curl)
+command -v unzip >/dev/null || missing+=(unzip)
+command -v git >/dev/null || missing+=(git)
+[ -f /etc/ssl/certs/ca-certificates.crt ] || missing+=(ca-certificates)
+if ! command -v make >/dev/null || ! command -v gcc >/dev/null; then
+  missing+=(build-essential)
+fi
+if [ "${#missing[@]}" -gt 0 ]; then
+  log "installing: ${missing[*]}"
+  apt-get update -qq
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${missing[@]}"
+fi
+step_end "system packages"
+
+# ------------------------------------------------------------------- Erlang
+step_begin "Erlang/OTP ${OTP_VERSION}"
+if "$OTP_DIR/bin/erl" -noshell -eval 'halt(0).' >/dev/null 2>&1; then
+  log "OTP already installed, skipping download"
+else
+  tmp="$(mktemp -d)"
+  curl -fsSL -o "$tmp/otp.tar.gz" \
+    "https://builds.hex.pm/builds/otp/${OTP_OS}/OTP-${OTP_VERSION}.tar.gz"
+  mkdir -p "$OTP_PARENT"
+  rm -rf "$OTP_DIR"
+  tar xzf "$tmp/otp.tar.gz" -C "$OTP_PARENT"
+  (cd "$OTP_DIR" && ./Install -minimal "$OTP_DIR")
+  rm -rf "$tmp"
+  "$OTP_DIR/bin/erl" -noshell -eval 'halt(0).'
+fi
+step_end "Erlang/OTP ${OTP_VERSION}"
+
+# ------------------------------------------------------------------- linking
+# Expose both toolchains on the default PATH so Amp, supervised services and
+# every non-interactive shell find them without profile hooks.
+BIN_DIR="/usr/local/bin"
+if [ ! -w "$BIN_DIR" ]; then
+  BIN_DIR="$HOME/.local/bin"
+  mkdir -p "$BIN_DIR"
+fi
+link_toolchain() {
+  local f linked=0
+  for f in "$@"; do
+    if [ -f "$f" ]; then
+      ln -sf "$f" "$BIN_DIR/$(basename "$f")"
+      linked=$((linked + 1))
+    fi
+  done
+  log "linked $linked executables into $BIN_DIR"
+}
+
+step_begin "link Erlang/OTP"
+link_toolchain "$OTP_DIR"/bin/*
+step_end "link Erlang/OTP"
+
+# -------------------------------------------------------------------- Elixir
+step_begin "Elixir ${ELIXIR_VERSION}"
+if PATH="$BIN_DIR:$PATH" "$ELIXIR_DIR/bin/elixir" --version >/dev/null 2>&1; then
+  log "Elixir already installed, skipping download"
+else
+  tmp="$(mktemp -d)"
+  curl -fsSL -o "$tmp/elixir.zip" \
+    "https://github.com/elixir-lang/elixir/releases/download/v${ELIXIR_VERSION}/elixir-otp-${OTP_VERSION%%.*}.zip"
+  mkdir -p "$ELIXIR_PARENT"
+  rm -rf "$ELIXIR_DIR"
+  mkdir -p "$ELIXIR_DIR"
+  unzip -q "$tmp/elixir.zip" -d "$ELIXIR_DIR"
+  rm -rf "$tmp"
+  PATH="$BIN_DIR:$PATH" "$ELIXIR_DIR/bin/elixir" --version
+fi
+step_end "Elixir ${ELIXIR_VERSION}"
+
+step_begin "link Elixir"
+link_toolchain "$ELIXIR_DIR"/bin/*
+step_end "link Elixir"
+
+log "toolchain: $(elixir --version | tr '\n' ' ')"
+
+# ------------------------------------------------------------- hex + rebar
+step_begin "hex + rebar archives"
+mix local.hex --if-missing
+mix local.rebar --if-missing
+step_end "hex + rebar archives"
+
+# ------------------------------------------------------- deps and warm build
+step_begin "mix deps.get"
+mix deps.get
+step_end "mix deps.get"
+
+step_begin "compile (test env)"
+MIX_ENV=test mix compile
+step_end "compile (test env)"
+
+step_begin "compile (dev env)"
+mix compile
+step_end "compile (dev env)"
+
+# ---------------------------------------------------------------- env file
+if [ -f .env.example ] && [ ! -f .env ]; then
+  cp -- .env.example .env
+  log "created .env from .env.example (all keys empty)"
+fi
+
+log "setup finished in ${SECONDS}s"

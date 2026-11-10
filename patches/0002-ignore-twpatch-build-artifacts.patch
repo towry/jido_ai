@@ -1,0 +1,13 @@
+diff --git a/.gitignore b/.gitignore
+index 9f23565a..ce22b167 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -21,6 +21,8 @@ erl_crash.dump
+ 
+ # Ignore package tarball (built via "mix hex.build").
+ jido_ai-*.tar
++jido_ai_twpatch-*.tar
++jido_ai_twpatch-*/
+ 
+ # Temporary files, for example, from tests.
+ /tmp/

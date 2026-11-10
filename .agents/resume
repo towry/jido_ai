@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# No services or credentials to restore for this library.
+# Fast sanity check that the toolchain and deps from .agents/setup are present.
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+command -v mix >/dev/null || { echo "resume: mix not on PATH, run .agents/setup" >&2; exit 1; }
+command -v erl >/dev/null || { echo "resume: erl not on PATH, run .agents/setup" >&2; exit 1; }
+[ -d "$root/deps" ] || { echo "resume: deps missing, run .agents/setup" >&2; exit 1; }

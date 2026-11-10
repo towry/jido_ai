@@ -1,0 +1,98 @@
+name: Publish Hex
+
+on:
+  push:
+    branches: [deploy]
+    paths:
+      - 'patches/**'
+      - 'scripts/**'
+      - 'tools/**'
+      - '.github/workflows/publish-hex.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-hex
+  cancel-in-progress: false
+
+jobs:
+  publish-hex:
+    if: github.ref == 'refs/heads/deploy'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout patch branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Pin origin/main SHA and deploy SHA
+        id: base
+        run: |
+          git fetch origin main
+          MAIN_SHA=$(git rev-parse origin/main)
+          PATCH_SHA=$(git rev-parse HEAD)
+          echo "main_sha=$MAIN_SHA" >> "$GITHUB_OUTPUT"
+          echo "patch_sha=$PATCH_SHA" >> "$GITHUB_OUTPUT"
+          echo "Pinned origin/main=$MAIN_SHA patch(deploy)=$PATCH_SHA"
+
+      - name: Reset worktree to pinned main
+        run: |
+          git checkout --detach "${{ steps.base.outputs.main_sha }}"
+
+      - name: Restore patch files from deploy branch
+        run: |
+          git restore --source "${{ steps.base.outputs.patch_sha }}" -- patches scripts tools .github/workflows/check-patches.yml .github/workflows/publish-hex.yml
+
+      - name: Apply patches in order
+        run: |
+          bash scripts/apply.sh \
+            --repo-root "$PWD" \
+            --patches-dir "$PWD/patches"
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "29"
+          elixir-version: "1.20"
+
+      - name: Verify tag matches patched version
+        run: |
+          patched="$(sed -nE 's/^ *@version "([^"]+)"/\1/p' mix.exs)"
+          echo "patched @version: ${patched}"
+          # Tag is derived from @version; check the derived tag does not
+          # already point at a different commit (scripts/publish-hex.sh
+          # asserts this against the GitHub API too). Here we just pin
+          # the version for the job summary.
+          echo "version=${patched}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-mix-${{ hashFiles('mix.lock') }}
+
+      - run: mix local.hex --if-missing
+      - run: mix local.rebar --if-missing
+      - run: mix deps.get
+      - run: mix test
+      - run: mix compile
+
+      - name: Publish to hex.pm (never overwrites)
+        env:
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+          MAIN_SHA: ${{ steps.base.outputs.main_sha }}
+          PATCH_SHA: ${{ steps.base.outputs.patch_sha }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: bash scripts/publish-hex.sh
+
+      - name: Write summary
+        run: |
+          {
+            echo "## Hex Publish Result"
+            echo
+            echo "- Source (origin/main): \`${{ steps.base.outputs.main_sha }}\`"
+            echo "- Deploy (deploy): \`${{ steps.base.outputs.patch_sha }}\`"
+            echo "- Result: success"
+          } >> "$GITHUB_STEP_SUMMARY"
