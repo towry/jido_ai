@@ -82,6 +82,7 @@ jobs:
       - name: Publish to hex.pm (never overwrites)
         env:
           HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+          GH_TOKEN: ${{ github.token }}
           MAIN_SHA: ${{ steps.base.outputs.main_sha }}
           PATCH_SHA: ${{ steps.base.outputs.patch_sha }}
           GITHUB_REPOSITORY: ${{ github.repository }}
