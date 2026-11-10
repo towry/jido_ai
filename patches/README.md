@@ -11,6 +11,7 @@
 * `0002-ignore-twpatch-build-artifacts.patch` : 忽略 twpatch 构建产物
 * `0003-release-version.patch` : `@version` 单一真相源（patch 后 `mix.exs` 的 `@version`，如 `2.4.0-1`）
 * `0004-react-after-tool-round-synchronous-join-hook.patch` : 可选的 `after_tool_round` 同步 join hook（ReAct runner）
+* `0005-turn-tool-result-explicit-content-without-duplication-or-lossy-sanitization.patch` : 显式 `ReqLLM.ToolResult.content` 即为发给模型的完整内容，只发 content 本身，不在前置 JSON envelope 里同时复制 `output`/`metadata`，且不对显式 content 做 `Observe.sanitize_transport_payload` 的有损截断（>16k 字符串、>100 列表项等）。应用原值仍由原生 tuple/`ToolResult.output` 保存，`{:ok, raw, effects}` 的第三项保持 effects；无显式 content 时仍由 `output` 派生 envelope（旧行为）。
 
 ## Rules
 

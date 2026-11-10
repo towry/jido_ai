@@ -1,0 +1,118 @@
+diff --git a/lib/jido_ai/turn.ex b/lib/jido_ai/turn.ex
+index db6fc632..9365d73a 100644
+--- a/lib/jido_ai/turn.ex
++++ b/lib/jido_ai/turn.ex
+@@ -412,9 +412,18 @@ defmodule Jido.AI.Turn do
+   def format_tool_result_content({:error, error, _effects}), do: format_tool_result_content({:error, error})
+ 
+   def format_tool_result_content({:ok, %ToolResult{} = result}) do
+-    parts = normalize_content_parts(result.content)
+-    payload = build_tool_result_payload(result.output, json_safe_content_parts(parts), result.metadata)
+-    encode_tool_result_envelope(%{ok: true, result: payload}, parts)
++    case result.content do
++      nil ->
++        payload = build_tool_result_payload(result.output, nil, result.metadata)
++        encode_tool_result_envelope(%{ok: true, result: payload})
++
++      [] ->
++        payload = build_tool_result_payload(result.output, nil, result.metadata)
++        encode_tool_result_envelope(%{ok: true, result: payload})
++
++      explicit ->
++        explicit_content_parts(explicit)
++    end
+   end
+ 
+   def format_tool_result_content({:ok, result}) when is_binary(result),
+@@ -947,6 +956,21 @@ defmodule Jido.AI.Turn do
+     end
+   end
+ 
++  defp explicit_content_parts(content) when is_list(content) do
++    case normalize_content_parts(content) do
++      [] -> []
++      parts -> parts
++    end
++  end
++
++  defp explicit_content_parts(content) when is_binary(content) do
++    [ContentPart.text(content)]
++  end
++
++  defp explicit_content_parts(other) do
++    [ContentPart.text(inspect(other))]
++  end
++
+   # File content parts carry raw binary data that can't be JSON-encoded.
+   # Only include text-safe parts (text, image_url, video_url, thinking) in the JSON payload.
+   defp json_safe_content_parts(parts) when is_list(parts) do
+diff --git a/test/jido_ai/turn_test.exs b/test/jido_ai/turn_test.exs
+index 694b6379..372c7fd2 100644
+--- a/test/jido_ai/turn_test.exs
++++ b/test/jido_ai/turn_test.exs
+@@ -509,24 +509,58 @@ defmodule Jido.AI.TurnTest do
+       assert decoded["result"] == %{"summary" => "test result"}
+     end
+ 
+-    test "ToolResult file content parts with non-UTF-8 binary data are excluded from JSON payload" do
++    test "ToolResult explicit file content is sent as-is without JSON envelope" do
+       pdf_binary = <<0xE2, 0x28, 0xA1>>
+       file_part = ContentPart.file(pdf_binary, "test.pdf", "application/pdf")
+ 
+-      assert [
+-               %ContentPart{type: :text, text: encoded_payload},
+-               %ContentPart{type: :file}
+-             ] =
++      assert [%ContentPart{type: :file}] =
+                Turn.format_tool_result_content(
+                  {:ok, %ToolResult{output: %{summary: "test result"}, content: [file_part], metadata: %{}}}
+                )
++    end
+ 
+-      assert Jason.decode!(encoded_payload) == %{
++    test "ToolResult explicit content is the complete model-facing payload without output/metadata duplication" do
++      tr = %ToolResult{
++        output: %{document_id: "doc_123", page_count: 4},
++        content: [ContentPart.text("The requested document is attached.")],
++        metadata: %{provider_native: %{request_id: "req_123"}}
++      }
++
++      assert [%ContentPart{type: :text, text: "The requested document is attached."}] =
++               Turn.format_tool_result_content({:ok, tr})
++    end
++
++    test "ToolResult explicit long string is not lossily sanitized" do
++      long = String.duplicate("a", 20_000)
++      tr = %ToolResult{output: %{id: 1}, content: [ContentPart.text(long)], metadata: %{}}
++
++      assert [%ContentPart{type: :text, text: text}] = Turn.format_tool_result_content({:ok, tr})
++      assert byte_size(text) == 20_000
++    end
++
++    test "ToolResult explicit long list output does not leak into model content" do
++      big_list = Enum.map(1..150, fn i -> %{"index" => i} end)
++      tr = %ToolResult{output: %{items: big_list}, content: [ContentPart.text("summary")], metadata: %{}}
++
++      assert [%ContentPart{type: :text, text: "summary"}] = Turn.format_tool_result_content({:ok, tr})
++    end
++
++    test "ToolResult without explicit content derives the envelope from output" do
++      tr = %ToolResult{output: %{value: 1}, content: nil, metadata: %{}}
++
++      assert decode_tool_content(Turn.format_tool_result_content({:ok, tr})) == %{
+                "ok" => true,
+-               "result" => %{"summary" => "test result"}
++               "result" => %{"value" => 1}
+              }
+     end
+ 
++    test "ToolResult explicit binary content is sent as-is" do
++      tr = %ToolResult{output: %{id: 1}, content: "explicit string", metadata: %{}}
++
++      assert [%ContentPart{type: :text, text: "explicit string"}] =
++               Turn.format_tool_result_content({:ok, tr})
++    end
++
+     test "bare file content-part lists with non-UTF-8 binary data omit JSON content payload" do
+       pdf_binary = <<0xE2, 0x28, 0xA1>>
+       file_part = ContentPart.file(pdf_binary, "test.pdf", "application/pdf")
