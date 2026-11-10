@@ -30,8 +30,8 @@ fi
 
 # Build the tarball and checksum it. hex tarballs are deterministic for a
 # given tree, so a same-version rebuild must produce the same bytes.
-mix hex.build --yes
-tarball="$(ls jido_ai-*.tar | head -n1)"
+mix hex.build
+tarball="$(ls jido_ai_twpatch-*.tar | head -n1)"
 [[ -n "$tarball" ]] || { echo "no hex tarball built" >&2; exit 1; }
 sha="$(sha256sum "$tarball")"
 sha="${sha%% *}"
